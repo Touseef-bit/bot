@@ -1,8 +1,8 @@
 import "reflect-metadata";
 import { DataSource } from "typeorm";
-import { DocumentEntity } from "../Entity/entity";
+import { DocumentEntity } from "../Entity/entity.js";
 
-export const AppDataSource = new DataSource({
+const AppDataSource = new DataSource({
   type: "mariadb",
   host: "localhost",
   port: 3306,
@@ -10,6 +10,7 @@ export const AppDataSource = new DataSource({
   password: "",
   database: "ragdb",
   synchronize: true, 
-  logging: true,
   entities: [DocumentEntity],
 });
+
+export default AppDataSource

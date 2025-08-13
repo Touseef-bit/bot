@@ -1,50 +1,111 @@
 import express from "express";
 import dotenv from "dotenv";
-import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
-import { AppDataSource } from "./db/Db";
+import {
+  GoogleGenerativeAIEmbeddings,
+} from "@langchain/google-genai";
+import AppDataSource from "./db/Db.js";
 import crypto from "crypto";
-dotenv.config()
+import { CheerioWebBaseLoader } from "@langchain/community/document_loaders/web/cheerio";
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+import { DocumentEntity } from "./Entity/entity.js";
+import { BasePromptTemplate } from "langchain/prompts";
+dotenv.config();
 
-const app = express()
-const PORT = 3000
+const app = express();
+const PORT = 3000;
 
-export function hashText(text) {
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+function hashText(text) {
   return crypto.createHash("sha256").update(text).digest("hex");
 }
-const model = new ChatGoogleGenerativeAI({
-  apiKey:process.env.OPEN_AI_KEY,
-  model:"gemini-1.5-flash",
-  temperature:0.7
-})
 
-await AppDataSource.initialize();
-const repo = AppDataSource.getRepository("Document");
-
-const loader = new CheerioWebBaseLoader("https://thecodingbuzz.com/");
-const docs = await loader.load();
-
-const splitter = new RecursiveCharacterTextSplitter({
-  chunkSize: 1000,
-  chunkOverlap: 200,
+const embeddings = new GoogleGenerativeAIEmbeddings({
+  apiKey: process.env.GOOGLE_AI_KEY, 
+  model: "embedding-001",              
 });
 
-const splitDocs = await splitter.splitDocuments(docs);
 
-for (const doc of splitDocs) {
-  const hash = hashText(doc.pageContent)
+const prompt = new BasePromptTemplate({
+  template,
+  inputVariables: ["question"]
+});
 
-  if (await repo.findOne({ where: { hash } })) continue;
+await AppDataSource.initialize();
+const docRepo = AppDataSource.getRepository(DocumentEntity);
 
-  const vector = await embeddings.embedQuery(doc.pageContent);
+// --- Ingest ONCE at startup (recommended) ---
+const loader = new CheerioWebBaseLoader("https://en.wikipedia.org/wiki/Artificial_intelligence");
+const docs = await loader.load();
+const splitter = new RecursiveCharacterTextSplitter({ chunkSize: 1000, chunkOverlap: 200 });
+const chunks = await splitter.splitDocuments(docs);
 
-  await repo.save({
+for (const chunk of chunks) {
+  const hash = hashText(chunk.pageContent);
+  const exists = await docRepo.findOne({ where: { hash } });
+  if (exists) continue;
+
+  const vector = await embeddings.embedQuery(chunk.pageContent);
+
+  const newDoc = docRepo.create({
     hash,
-    content: doc.pageContent,
-    embedding: JSON.stringify(vector),
+    content: chunk.pageContent,
+    embedding: JSON.stringify(vector),  
   });
+  await docRepo.save(newDoc);
 }
-app.get("/",async(req,res)=>{
-})
-app.listen(PORT,()=>{
-  console.log(`Server running at Port ${PORT}`)
-})
+
+function cosineSimilarity(vecA, vecB) {
+  const dot = vecA.reduce((sum, a, i) => sum + a * vecB[i], 0);
+  const normA = Math.sqrt(vecA.reduce((sum, a) => sum + a * a, 0));
+  const normB = Math.sqrt(vecB.reduce((sum, b) => sum + b * b, 0));
+  return dot / (normA * normB || 1);
+}
+
+async function search(query, topK = 1) {
+  const queryVector = await embeddings.embedQuery(query);
+  const allDocs = await docRepo.find();
+
+  const values = allDocs.map((doc) => {
+    let vector = [];
+    try {
+      vector = JSON.parse(doc.embedding || "[]"); 
+    } catch (err) {
+      console.error("Error parsing embedding for doc id", doc.id, err);
+      vector = [];
+    }
+
+    return {
+      ...doc,
+      value: vector.length ? cosineSimilarity(queryVector, vector) : -Infinity,
+    };
+  });
+
+  return values.sort((a, b) => b.value - a.value).slice(0, topK);
+}
+// ---- routes ----
+app.post("/", async (req, res) => {
+  try {
+    const message = req.body.message; 
+    const promptsMessage = await prompt.format({ question: message });
+    console.log(promptsMessage)
+    if (!message) return res.status(400).json({ error: "message is required" });
+
+    const results = await search(promptsMessage);
+    res.json(
+      results.map(r => ({
+        id: r.id,
+        hash: r.hash,
+        preview: r.content,
+      }))
+    );
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "internal error" });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running at Port ${PORT}`);
+});
